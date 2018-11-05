@@ -1,0 +1,178 @@
+From 17f84a58172e53daef686bbc3a8121406bb11faf Mon Sep 17 00:00:00 2001
+From: Yizhou Chen <yc2755@nyu.edu>
+Date: Sun, 25 Mar 2018 23:07:59 -0400
+Subject: [PATCH] yc2755 implemented server.go
+
+---
+ src/simplepb/config.go |   2 +
+ src/simplepb/server.go | 102 ++++++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 98 insertions(+), 6 deletions(-)
+
+diff --git a/src/simplepb/config.go b/src/simplepb/config.go
+index b8b662a..68cf84c 100644
+--- a/src/simplepb/config.go
++++ b/src/simplepb/config.go
+@@ -194,6 +194,7 @@ func (cfg *config) waitCommitted(primary, index int) {
+ 	t0 := time.Now()
+ 	for time.Since(t0).Seconds() < 10 {
+ 		committed := pri.IsCommitted(index)
++		//fmt.Println(index, pri.me, committed)
+ 		if committed {
+ 			return
+ 		}
+@@ -247,6 +248,7 @@ func (cfg *config) replicateOne(server int, cmd int, expectedServers int) (
+ 	t0 := time.Now()
+ 	for time.Since(t0).Seconds() < 10 {
+ 		committed := pri.IsCommitted(index)
++		//fmt.Println(index, pri.me, committed)
+ 		if committed {
+ 			nReplicated := 0
+ 			for i := 0; i < len(cfg.pbservers); i++ {
+diff --git a/src/simplepb/server.go b/src/simplepb/server.go
+index ca5efb4..0f46f74 100644
+--- a/src/simplepb/server.go
++++ b/src/simplepb/server.go
+@@ -10,6 +10,7 @@ import (
+ 	"sync"
+ 
+ 	"labrpc"
++	"fmt"
+ )
+ 
+ // the 3 possible server status
+@@ -168,7 +169,29 @@ func (srv *PBServer) Start(command interface{}) (
+ 		return -1, srv.currentView, false
+ 	}
+ 
+-	// Your code here
++	srv.log = append(srv.log, command)
++	fmt.Printf("After new append %v\n", srv.log)
++
++	go func(srv *PBServer, command interface{}, logLen int) {
++		prepareArgs := &PrepareArgs {View: srv.currentView, PrimaryCommit: srv.commitIndex, Index: logLen - 1, Entry: command}
++		prepareReply := &PrepareReply {}
++		var numResponse int
++		for i := 0; i < len(srv.peers); i++ {
++			fmt.Printf("Send prepare to %d\n", i)
++			isSend := srv.sendPrepare(i, prepareArgs, prepareReply)
++			if isSend && prepareReply.Success == true {
++				numResponse++
++				if numResponse > len(srv.peers) / 2 && srv.commitIndex < logLen - 1 {
++					srv.commitIndex = logLen - 1
++				}
++			}
++		}
++	} (srv, command, len(srv.log))
++	
++	fmt.Println("Time to return value")
++	index = len(srv.log) - 1
++	view = srv.currentView
++	ok = true
+ 
+ 	return index, view, ok
+ }
+@@ -195,12 +218,43 @@ func (srv *PBServer) sendPrepare(server int, args *PrepareArgs, reply *PrepareRe
+ 
+ // Prepare is the RPC handler for the Prepare RPC
+ func (srv *PBServer) Prepare(args *PrepareArgs, reply *PrepareReply) {
+-	// Your code here
++	srv.mu.Lock()
++	defer srv.mu.Unlock()
++
++	fmt.Printf("This is for server %d\n", srv.me)
++	if srv.me == GetPrimary(args.View, len(srv.peers)) {
++		reply.Success = true
++	} else if srv.currentView == args.View && len(srv.log) == args.Index {
++		srv.log = append(srv.log, args.Entry)			
++		srv.commitIndex = args.PrimaryCommit
++		reply.Success = true
++	} else if srv.currentView < args.View || len(srv.log) < args.Index {
++		reply.Success = false
++		recoveryArgs := &RecoveryArgs {View: args.View, Server: srv.me}
++		recoveryReply := &RecoveryReply {}
++		isRecovery := srv.peers[GetPrimary(args.View, len(srv.peers))].Call("PBServer.Recovery", recoveryArgs, recoveryReply)
++		if isRecovery && recoveryReply.Success == true {
++			srv.currentView = recoveryReply.View
++			srv.commitIndex = recoveryReply.PrimaryCommit
++			srv.log = recoveryReply.Entries
++			reply.Success = true
++		}
++	} else {
++		reply.Success = false
++	}
++	fmt.Printf("%v server %d %d\n", srv.log, srv.me, srv.commitIndex)
++	reply.View = srv.currentView
+ }
+ 
+ // Recovery is the RPC handler for the Recovery RPC
+ func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
+-	// Your code here
++	srv.mu.Lock()
++	defer srv.mu.Unlock()
++	
++	reply.View = srv.currentView
++	reply.Entries = srv.log
++	reply.PrimaryCommit = srv.commitIndex
++	reply.Success = true
+ }
+ 
+ // Some external oracle prompts the primary of the newView to
+@@ -275,16 +329,52 @@ func (srv *PBServer) PromptViewChange(newView int) {
+ // otherwise, ok = false.
+ func (srv *PBServer) determineNewViewLog(successReplies []*ViewChangeReply) (
+ 	ok bool, newViewLog []interface{}) {
+-	// Your code here
++	srv.mu.Lock()
++	defer srv.mu.Unlock()
++
++	if len(successReplies) > 0 {
++		ok = true
++	} else {
++		ok = false
++	}
++	var maxLastNormalView int
++	for i:= 0; i < len(successReplies); i++ {
++		if successReplies[i].LastNormalView > maxLastNormalView {
++			maxLastNormalView = successReplies[i].LastNormalView
++			newViewLog = successReplies[i].Log
++		}
++		if successReplies[i].LastNormalView == maxLastNormalView && len(successReplies[i].Log) > len(newViewLog) {
++			newViewLog = successReplies[i].Log
++		}
++	}
++
+ 	return ok, newViewLog
+ }
+ 
+ // ViewChange is the RPC handler to process ViewChange RPC.
+ func (srv *PBServer) ViewChange(args *ViewChangeArgs, reply *ViewChangeReply) {
+-	// Your code here
++	srv.mu.Lock()
++	defer srv.mu.Unlock()
++
++	if args.View > srv.currentView {
++		srv.status = VIEWCHANGE
++		reply.Success = true
++		reply.Log = srv.log
++		reply.LastNormalView = srv.currentView
++	} else {
++		reply.Success = false
++	}
+ }
+ 
+ // StartView is the RPC handler to process StartView RPC.
+ func (srv *PBServer) StartView(args *StartViewArgs, reply *StartViewReply) {
+-	// Your code here
++	srv.mu.Lock()
++	defer srv.mu.Unlock()
++
++	if args.View >= srv.currentView {
++		srv.log = args.Log
++		srv.currentView = args.View
++		srv.status = NORMAL
++	}
++	
+ }
+-- 
+1.9.3 (Apple Git-50)
+
